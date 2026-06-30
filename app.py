@@ -1,27 +1,17 @@
 """
 ============================================================
- AQI Monitor — Python ML Auto-Retrain Microservice (SQLite)
+ AQI Monitor — Python ML Auto-Retrain Microservice
  Student : Anantharajan Vel Murugan | 294FAVZE | UoH
- 
- PURPOSE:
- Separate Python service that:
- 1. Stores sensor readings in local SQLite (no external DB needed)
- 2. Auto-retrains Random Forest every N new readings
- 3. Saves trained model + accuracy
- 4. Exposes /predict and /status endpoints for Node backend
-
- NOTE: Render free tier wipes disk on restart. For continuous
- uptime between restarts, this works perfectly. CSV backup
- of your original 1,440 readings protects against data loss.
+ Version : No-pandas (avoids C-compile issues on Render)
 ============================================================
 """
 
 import os
+import csv
 import time
 import sqlite3
 import threading
 import numpy as np
-import pandas as pd
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -34,7 +24,6 @@ import joblib
 app = Flask(__name__)
 CORS(app)
 
-# ── Config ────────────────────────────────────────────────
 RETRAIN_EVERY = int(os.environ.get("RETRAIN_EVERY", "100"))
 DB_PATH = "/tmp/aqi_data.db"
 MODEL_PATH = "/tmp/rf_model.pkl"
@@ -42,22 +31,13 @@ ENCODER_PATH = "/tmp/label_encoder.pkl"
 
 FEATURES = ['temperature', 'humidity', 'pm25', 'pm10', 'mq135', 'mq7']
 
-# ════════════════════════════════════════════════════════════
-#  SQLITE SETUP
-# ════════════════════════════════════════════════════════════
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            temperature REAL,
-            humidity REAL,
-            pm25 REAL,
-            pm10 REAL,
-            mq135 REAL,
-            mq7 REAL,
-            aqi REAL,
-            aqi_label TEXT,
+            temperature REAL, humidity REAL, pm25 REAL, pm10 REAL,
+            mq135 REAL, mq7 REAL, aqi REAL, aqi_label TEXT,
             received_at TEXT
         )
     """)
@@ -70,9 +50,9 @@ def get_db():
 
 def count_readings():
     conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
+    c = conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
     conn.close()
-    return count
+    return c
 
 def insert_reading(data):
     conn = get_db()
@@ -89,59 +69,56 @@ def insert_reading(data):
     conn.close()
 
 def fetch_all_readings():
+    """Returns numpy arrays X, y without pandas"""
     conn = get_db()
-    df = pd.read_sql_query("SELECT * FROM readings", conn)
+    cur = conn.execute(
+        "SELECT temperature, humidity, pm25, pm10, mq135, mq7, aqi_label FROM readings"
+    )
+    rows = cur.fetchall()
     conn.close()
-    return df
+    return rows
 
 def seed_from_csv_if_empty(csv_path="seed_data.csv"):
-    """Optional: pre-load your original 1,440 readings if DB starts empty"""
     if count_readings() > 0:
         return
     if not os.path.exists(csv_path):
         print("[Seed] No seed_data.csv found — starting with empty DB")
         return
     try:
-        df = pd.read_csv(csv_path)
-        df.columns = df.columns.str.lower().str.strip()
         conn = get_db()
-        for _, row in df.iterrows():
-            try:
-                conn.execute("""
-                    INSERT INTO readings
-                    (temperature, humidity, pm25, pm10, mq135, mq7, aqi, aqi_label, received_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    float(row['temperature']), float(row['humidity']),
-                    float(row['pm25']), float(row['pm10']),
-                    float(row['mq135']), float(row['mq7']),
-                    float(row['aqi']), str(row['aqi_label']).upper(),
-                    datetime.utcnow().isoformat() + "Z"
-                ))
-            except Exception:
-                continue
+        loaded = 0
+        with open(csv_path, newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    keys = {k.lower().strip(): v for k, v in row.items()}
+                    conn.execute("""
+                        INSERT INTO readings
+                        (temperature, humidity, pm25, pm10, mq135, mq7, aqi, aqi_label, received_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        float(keys['temperature']), float(keys['humidity']),
+                        float(keys['pm25']), float(keys['pm10']),
+                        float(keys['mq135']), float(keys['mq7']),
+                        float(keys['aqi']), str(keys['aqi_label']).upper(),
+                        datetime.utcnow().isoformat() + "Z"
+                    ))
+                    loaded += 1
+                except Exception:
+                    continue
         conn.commit()
         conn.close()
-        print(f"[Seed] Loaded {count_readings()} rows from {csv_path}")
+        print(f"[Seed] Loaded {loaded} rows from {csv_path}")
     except Exception as e:
         print(f"[Seed] Error loading CSV: {e}")
 
 
-# ── Global state ──────────────────────────────────────────
 state = {
-    "model": None,
-    "encoder": None,
-    "accuracy": None,
-    "cv_accuracy": None,
-    "trained_at": None,
-    "training_rows": 0,
-    "last_count_checked": 0,
+    "model": None, "encoder": None, "accuracy": None, "cv_accuracy": None,
+    "trained_at": None, "training_rows": 0, "last_count_checked": 0,
     "is_training": False,
 }
 
-# ════════════════════════════════════════════════════════════
-#  TRAINING FUNCTION
-# ════════════════════════════════════════════════════════════
 def train_model():
     if state["is_training"]:
         return False
@@ -149,27 +126,36 @@ def train_model():
     print(f"[Train] Starting at {datetime.now()}")
 
     try:
-        df = fetch_all_readings()
-        if len(df) < 30:
-            print(f"[Train] Not enough data yet ({len(df)} rows) — need 30+")
+        rows = fetch_all_readings()
+        if len(rows) < 30:
+            print(f"[Train] Not enough data yet ({len(rows)} rows) — need 30+")
             state["is_training"] = False
             return False
 
-        for c in FEATURES + ['aqi']:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        df['aqi_label'] = df['aqi_label'].astype(str).str.upper().str.strip()
-        df.dropna(subset=FEATURES + ['aqi', 'aqi_label'], inplace=True)
-        df = df[df['temperature'] > 0]
-        df = df[df['humidity'] > 0]
-        df.drop_duplicates(subset=FEATURES, inplace=True)
+        X_list, y_list = [], []
+        seen = set()
+        for r in rows:
+            try:
+                temp, hum, pm25, pm10, mq135, mq7, label = r
+                temp, hum, pm25, pm10, mq135, mq7 = map(float, [temp, hum, pm25, pm10, mq135, mq7])
+                if temp <= 0 or hum <= 0:
+                    continue
+                key = (temp, hum, pm25, pm10, mq135, mq7)
+                if key in seen:
+                    continue
+                seen.add(key)
+                X_list.append([temp, hum, pm25, pm10, mq135, mq7])
+                y_list.append(str(label).upper().strip())
+            except Exception:
+                continue
 
-        if len(df) < 30:
-            print(f"[Train] Not enough clean data ({len(df)} rows)")
+        if len(X_list) < 30:
+            print(f"[Train] Not enough clean data ({len(X_list)} rows)")
             state["is_training"] = False
             return False
 
-        X = df[FEATURES]
-        y = df['aqi_label']
+        X = np.array(X_list)
+        y = np.array(y_list)
 
         le = LabelEncoder()
         y_enc = le.fit_transform(y)
@@ -201,10 +187,10 @@ def train_model():
         state["accuracy"] = round(acc * 100, 2)
         state["cv_accuracy"] = round(cv_scores.mean() * 100, 2)
         state["trained_at"] = datetime.utcnow().isoformat() + "Z"
-        state["training_rows"] = len(df)
+        state["training_rows"] = len(X_list)
         state["last_count_checked"] = count_readings()
 
-        print(f"[Train] Done! Accuracy={state['accuracy']}% CV={state['cv_accuracy']}% Rows={len(df)}")
+        print(f"[Train] Done! Accuracy={state['accuracy']}% CV={state['cv_accuracy']}% Rows={len(X_list)}")
         state["is_training"] = False
         return True
 
@@ -224,9 +210,6 @@ def load_existing_model():
         print(f"[Startup] Could not load existing model: {e}")
 
 
-# ════════════════════════════════════════════════════════════
-#  BACKGROUND THREAD
-# ════════════════════════════════════════════════════════════
 def background_retrain_checker():
     while True:
         try:
@@ -242,14 +225,10 @@ def background_retrain_checker():
         time.sleep(30)
 
 
-# ════════════════════════════════════════════════════════════
-#  API ENDPOINTS
-# ════════════════════════════════════════════════════════════
-
 @app.route("/")
 def home():
     return jsonify({
-        "service": "AQI ML Auto-Retrain Microservice (SQLite)",
+        "service": "AQI ML Auto-Retrain Microservice",
         "student": "Anantharajan Vel Murugan | 294FAVZE | UoH",
         "routes": ["/status", "/predict (POST)", "/retrain-now (POST)", "/ingest (POST)"],
     })
@@ -278,12 +257,9 @@ def predict():
     data = request.get_json()
     try:
         features = [[
-            float(data["temperature"]),
-            float(data["humidity"]),
-            float(data["pm25"]),
-            float(data["pm10"]),
-            float(data["mq135"]),
-            float(data["mq7"]),
+            float(data["temperature"]), float(data["humidity"]),
+            float(data["pm25"]), float(data["pm10"]),
+            float(data["mq135"]), float(data["mq7"]),
         ]]
         pred_idx = state["model"].predict(features)[0]
         pred_label = state["encoder"].inverse_transform([pred_idx])[0]
@@ -304,29 +280,21 @@ def predict():
 def retrain_now():
     success = train_model()
     return jsonify({
-        "success": success,
-        "accuracy": state["accuracy"],
-        "cv_accuracy": state["cv_accuracy"],
-        "trained_at": state["trained_at"],
+        "success": success, "accuracy": state["accuracy"],
+        "cv_accuracy": state["cv_accuracy"], "trained_at": state["trained_at"],
     })
 
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
-    """Node backend calls this for every ESP32 reading"""
     data = request.get_json()
     required = ['temperature', 'humidity', 'pm25', 'pm10', 'mq135', 'mq7', 'aqi', 'aqi_label']
     if not all(k in data for k in required):
         return jsonify({"error": "Missing fields", "required": required}), 400
-
     insert_reading(data)
-    count = count_readings()
-    return jsonify({"status": "ok", "total_readings": count})
+    return jsonify({"status": "ok", "total_readings": count_readings()})
 
 
-# ════════════════════════════════════════════════════════════
-#  STARTUP
-# ════════════════════════════════════════════════════════════
 init_db()
 seed_from_csv_if_empty()
 load_existing_model()
